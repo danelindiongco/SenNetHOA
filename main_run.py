@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import copy
 import cv2
+
+# pytorch imports
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -24,6 +26,10 @@ from colorama import Fore, Back, Style
 
 c_ = Fore.GREEN
 sr_ = Style.RESET_ALL
+
+from sklearn.model_selection import KFold
+from sklearn.model_selection import train_test_split
+import tifffile as tiff
 
 
 class CFG:
@@ -57,6 +63,20 @@ class CFG:
         self.valid_groups = ["kidney_3_dense"]
         self.loss_func = "DiceLoss"
 
+        self.data_transforms = {
+            "train": A.Compose([
+                A.Resize(*self.img_size, interpolation=cv2.INTER_CUBIC),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.Rotate(limit=45, p=0.5),
+                A.RandomScale(scale_limit=(0.8, 1.25), interpolation=cv2.INTER_CUBIC, p=0.5),
+                A.RandomCrop(*self.img_size, p=1), ], p=1.0),  # using *self operator for iterative unpacking od li
+            "valid": A.Compose([
+                A.Resize(*self.img_size, interpolation=cv2.INTER_NEAREST), ], p=1.0)
+        }
+
+        self.optimizers = 'adam'
+
 
 class BuildDataset(Dataset):
     def __init__(self, img_paths, msk_paths=[], transforms=None):
@@ -80,6 +100,7 @@ class BuildDataset(Dataset):
                 msk = data['mask']
             img = np.transpose(img, (2, 0, 1))
             return torch.tensor(img), torch.tensor(msk)
+
         else:
             orig_size = img.shape
             if self.transforms:
@@ -118,56 +139,81 @@ def set_seed(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
+def show_images(images, titles=None, cmap='gray'):
+    n = len(images)
+    fig, axes = plt.subplots(1, n, figsize=(20, 10))
+    if not isinstance(axes, np.ndarray):
+        axes = [axes]
+    for idx, ax in enumerate(axes):
+        ax.imshow(images[idx], cmap=cmap)
+        if titles:
+            ax.set_title(titles[idx])
+        ax.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
 if __name__ == '__main__':
-    CFG = CFG()
+    config = CFG()
 
-    set_seed(CFG.seed)
+    set_seed(config.seed)
 
-    train_groups = CFG.train_groups
-    valid_groups = CFG.valid_groups
+    train_groups = config.train_groups
+    valid_groups = config.valid_groups
 
-    gt_df = pd.read_csv(CFG.gt_df)
-    gt_df["img_path"] = gt_df["img_path"].apply(lambda x: os.path.join(CFG.data_root, x))
-    gt_df["msk_path"] = gt_df["msk_path"].apply(lambda x: os.path.join(CFG.data_root, x))
+    gt_df = pd.read_csv(config.gt_df)
+    train_images_path = os.path.join(config.data_root, 'train', config.train_groups[0], 'images')
+    train_labels_path = os.path.join(config.data_root, 'train', config.train_groups[0], 'labels')
 
-    train_df = gt_df.query("group in @train_groups").reset_index(drop=True)
-    valid_df = gt_df.query("group in @valid_groups").reset_index(drop=True)
+    valid_images_path = os.path.join(config.data_root, 'test', config.valid_groups[0], 'images')
+    valid_labels_path = os.path.join(config.data_root, 'test', config.valid_groups[0], 'labels')
 
-    train_img_paths = train_df["img_path"].values.tolist()
-    train_msk_paths = train_df["msk_path"].values.tolist()
+    image_files = sorted(
+        [os.path.join(train_images_path, f) for f in os.listdir(train_images_path) if f.endswith('.tif')])
+    label_files = sorted(
+        [os.path.join(train_labels_path, f) for f in os.listdir(train_labels_path) if f.endswith('.tif')])
 
-    valid_img_paths = valid_df["img_path"].values.tolist()
-    valid_msk_paths = valid_df["msk_path"].values.tolist()
+    # ____________________________________________________________________________________________
+    first_image = tiff.imread(image_files[981])
+    first_label = tiff.imread(label_files[981])
 
-    if CFG.debug:
-        train_img_paths = train_img_paths[:CFG.train_bs * 5]
-        train_msk_paths = train_msk_paths[:CFG.train_bs * 5]
-        valid_img_paths = valid_img_paths[:CFG.valid_bs * 3]
-        valid_msk_paths = valid_msk_paths[:CFG.valid_bs * 3]
+    show_images([first_image, first_label], titles=['Train Image', 'Train Label'])
 
-    train_dataset = BuildDataset(train_img_paths, train_msk_paths, transforms=CFG.data_transforms['train'])
-    valid_dataset = BuildDataset(valid_img_paths, valid_msk_paths, transforms=CFG.data_transforms['valid'])
+    # ____________________________________________________________________________________________
+    train_image_files, val_image_files, train_mask_files, val_mask_files = train_test_split(image_files, label_files,
+                                                                                            test_size=0.2,
+                                                                                            random_state=config.seed)
+    train_dataset = BuildDataset(train_image_files, train_mask_files, transforms=config.data_transforms['train'])
+    valid_dataset = BuildDataset(val_image_files, val_mask_files, transforms=config.data_transforms['valid'])
 
-    train_loader = DataLoader(train_dataset, batch_size=CFG.train_bs, num_workers=0, shuffle=True, pin_memory=True,
+    train_loader = DataLoader(train_dataset, batch_size=config.train_bs, num_workers=0, shuffle=True, pin_memory=True,
                               drop_last=False)
-    valid_loader = DataLoader(valid_dataset, batch_size=CFG.valid_bs, num_workers=0, shuffle=False, pin_memory=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=config.valid_bs, num_workers=0, shuffle=False, pin_memory=True)
 
-    sample_ids = [random.randint(0, len(train_img_paths)) for _ in range(5)]
-    for sample_id in sample_ids:
-        data_name = train_df.loc[sample_id]["id"]
-        img, msk = train_dataset[sample_id]
-        img = img.permute((1, 2, 0)).numpy() * 255.0
-        img = img.astype('uint8')
-        msk = (msk * 255).numpy().astype('uint8')
-        plt.figure(figsize=(9, 4))
-        print(data_name)
-        plt.axis('off')
-        plt.subplot(1, 3, 1)
-        plt.imshow(img)
-        plt.subplot(1, 3, 2)
-        plt.imshow(msk)
-        plt.subplot(1, 3, 3)
-        plt.imshow(img, cmap='bone')
-        plt.imshow(msk, alpha=0.5)
-        plt.show()
+    for batch_idx, (batch_images, batch_masks) in enumerate(train_loader):
+        print("Batch", batch_idx + 1)
+        print("Image batch shape:", batch_images.shape)
+        print("Mask batch shape:", batch_masks.shape)
+
+        for image, mask, image_path, mask_path in zip(batch_images, batch_masks, train_image_files, train_mask_files):
+            image = image.permute((1, 2, 0)).numpy() * 255.0
+            image = image.astype('uint8')
+            mask = (mask * 255).numpy().astype('uint8')
+
+            image_filename = os.path.basename(image_path)
+            mask_filename = os.path.basename(mask_path)
+
+            plt.figure(figsize=(15, 10))
+
+            plt.subplot(2, 4, 1)
+            plt.imshow(image, cmap='gray')
+            plt.title(f"Original Image - {image_filename}")
+
+            plt.subplot(2, 4, 2)
+            plt.imshow(mask, cmap='gray')
+            plt.title(f"Mask Image - {mask_filename}")
+
+            plt.tight_layout()
+            plt.show()
+        break
 
